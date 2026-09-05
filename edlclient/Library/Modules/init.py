@@ -19,6 +19,13 @@ except ImportError as e:
     pass
 
 try:
+    from edlclient.Library.Modules.oplus import oplus
+except ImportError as e:
+    print(e)
+    oplus = None
+    pass
+
+try:
     from edlclient.Library.Modules.oneplus import oneplus
 except ImportError as e:
     print(e)
@@ -80,6 +87,14 @@ class modules(metaclass=LogBase):
             self.error(e)
             return None
 
+    @cached_property
+    def oplus(self):
+        try:
+            return oplus(fh=self.fh, args=self.args, loglevel=self.__logger.level)
+        except Exception as e:
+            self.error(e)
+            return None
+
     def addpatch(self):
         if self.ops is not None:
             return self.ops.addpatch()
@@ -111,8 +126,25 @@ class modules(metaclass=LogBase):
             else:
                 options[args[i]] = True
         if command == "":
-            print("Valid commands are:\noemunlock, ops\n")
+            print("Valid commands are:\noemunlock, ops, oplus\n")
             return False
+        if self.oplus is not None and command == "oplus":
+            if "bypass" in options:
+                digest = options["digest"] if "digest" in options else None
+                sign = options["sign"] if "sign" in options else None
+                return self.oplus.bypass(digest=digest, sign=sign)
+            elif "verify" in options:
+                return self.oplus.cmd_verify()
+            elif "sha256init" in options:
+                return self.oplus.cmd_sha256init(verbose=True)
+            elif "resetdigest" in options:
+                return self.oplus.cmd_resetdigest()
+            elif "resettoedl" in options:
+                return self.oplus.cmd_reset_to_edl()
+            else:
+                self.error("Unknown mode given. Available are: bypass, verify, sha256init, "
+                           "resetdigest, resettoedl.")
+                return False
         if self.generic is not None and command == "oemunlock":
             if "enable" in options:
                 enable = True

@@ -7,9 +7,12 @@
 # GPLv3 and has to be open sourced under GPLv3 as well. !!!!!
 
 import os
+import re
+import glob
 import sys
 import logging
 import json
+import time
 from binascii import hexlify, unhexlify
 from struct import unpack, pack
 from edlclient.Library.firehose import firehose
@@ -60,6 +63,13 @@ class firehose_client(metaclass=LogBase):
         self.cfg.MaxPayloadSizeToTargetInBytes = getint(arguments["--maxpayload"])
         self.cfg.SECTOR_SIZE_IN_BYTES = getint(arguments["--sectorsize"])
         self.cfg.PAGES_PER_BLOCK = getint(arguments["--pagesperblock"])
+        if arguments.get("--specialrwmode") is not None:
+            special_rw_mode = arguments["--specialrwmode"].lower()
+            if special_rw_mode in ("off", "none", "no"):
+                special_rw_mode = ""
+            self.cfg.SpecialRwMode = special_rw_mode
+        elif arguments.get("--digestfile") is not None or arguments.get("--signfile") is not None:
+            self.cfg.SpecialRwMode = "oplus_gptmain"
         self.cfg.bit64 = sahara.bit64
         devicemodel = ""
         skipresponse = False
@@ -74,6 +84,32 @@ class firehose_client(metaclass=LogBase):
                                  devicemodel=devicemodel, serial=sahara.serial, skipresponse=skipresponse,
                                  luns=self.getluns(arguments), args=arguments)
         self.connected = False
+        self._canon_cache = None
+
+    def _update_canon_filenames(self, extra_dirs=()):
+        if not isinstance(self._canon_cache, dict):
+            self._canon_cache = {}
+        m = self._canon_cache
+        paths = []
+        for d in extra_dirs:
+            if d:
+                paths += glob.glob(os.path.join(d, "rawprogram*.xml"))
+        paths += glob.glob("rawprogram*/rawprogram*.xml")
+        paths += glob.glob("rawprogram*.xml")
+        for p in sorted(set(paths)):
+            if not re.fullmatch(r"(?:.*[/\\])?rawprogram\d*\.xml", p):
+                continue
+            try:
+                for _, elem in ET.iterparse(p, events=("end",)):
+                    if elem.tag == "program":
+                        lbl, fn = elem.get("label"), elem.get("filename")
+                        if lbl and fn and not m.get(lbl):
+                            m[lbl] = fn
+                    elem.clear()
+            except Exception as err:  # pylint: disable=broad-except
+                self.debug(f"rawprogram parse {p}: {err}")
+        self.firehose.cfg.CanonFilenames = m
+        return m
 
     def connect(self, sahara):
         self.firehose.connect()
@@ -112,6 +148,41 @@ class firehose_client(metaclass=LogBase):
                     "No --memory option set, we assume \"eMMC\" as default ..., if it fails, try using \"--memory\" " +
                     "with \"UFS\",\"NAND\" or \"spinor\" instead !")
                 self.cfg.MemoryName = "eMMC"
+        digest = self.arguments.get("--digestfile")
+        sign = self.arguments.get("--signfile")
+        if digest is not None or sign is not None:
+            if digest is None or sign is None:
+                self.error("Oplus bypass needs both --digestfile and --signfile.")
+                return False
+            try:
+                from edlclient.Library.Modules.oplus import oplus as oplus_module
+                op = oplus_module(fh=self.firehose, args=self.arguments, loglevel=self.__logger.level)
+                bypass_ok = op.bypass(digest=digest, sign=sign)
+                if not bypass_ok:
+                    # programmer may already be unlocked from a previous session
+                    self.warning("Oplus digest/signature bypass failed, protected areas may not be accessible.")
+                else:
+                    # unlock applies on the next firehose session
+                    try:
+                        self.cdc.close()
+                        time.sleep(0.3)
+                        self.cdc.connect()
+                        self.firehose._rx_clean = False
+                        self.firehose.connect()
+                        self.info("Firehose session reopened to apply the digest/signature unlock.")
+                    except Exception as err:  # pylint: disable=broad-except
+                        self.error(f"Could not reopen the firehose session ({err}).")
+                        return False
+            except Exception as err:  # pylint: disable=broad-except
+                self.error(f"Oplus bypass error: {err}")
+                return False
+        if (self.firehose.cfg.SpecialRwMode == "" and
+                any(f in self.firehose.supported_functions
+                    for f in ("verify", "sha256init", "programcust"))):
+            self.firehose.cfg.SpecialRwMode = "oplus_gptmain"
+        if any(f in self.firehose.supported_functions
+               for f in ("verify", "sha256init", "programcust")):
+            self._update_canon_filenames()
         if self.firehose.configure(0):
             funcs = "Supported functions:\n-----------------\n"
             for function in self.firehose.supported_functions:

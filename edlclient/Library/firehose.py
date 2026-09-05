@@ -328,6 +328,44 @@ class firehose(metaclass=LogBase):
         else:
             return response(resp=True, data=rdata)
 
+    def xmlsend_raw(self, data) -> response:
+        # send raw binary data without wrapping
+        self.cdc.flush()
+        self.cdc.xmlread = True
+        if isinstance(data, str):
+            data = bytes(data, 'utf-8')
+        if not self.cdc.write(data):
+            self.cdc.xmlread = False
+            return response(resp=False, error="Error on writing raw data to port.")
+        rdata = bytearray()
+        timeout = 10  # seconds
+        start = time.time()
+        while b"<response value" not in rdata:
+            try:
+                tmp = self.cdc.read(timeout=None)
+                if tmp == b"":
+                    if time.time() - start > timeout:
+                        break
+                    time.sleep(0.05)
+                rdata += tmp
+            except Exception as err:
+                self.error(err)
+                return response(resp=False, error=str(err))
+        self.cdc.xmlread = False
+        try:
+            log = self.xml.getlog(rdata)
+            for line in log:
+                self.info(line)
+            resp = self.xml.getresponse(rdata)
+            status = self.getstatus(resp)
+            if status:
+                return response(resp=True, data=resp, log=log)
+            else:
+                return response(resp=False, error=log, data=resp, log=log)
+        except Exception as err:
+            self.debug(str(err))
+            return response(resp=False, error=rdata)
+
     def cmd_reset(self, mode="reset"):
         if mode is None:
             mode = "reset"
