@@ -175,8 +175,11 @@ class firehose(metaclass=LogBase):
         MemoryName = "eMMC"
         prod_name = "Unknown"
         maxlun = 99
+        SpecialRwMode = ""
+        CanonFilenames = None
 
     def __init__(self, cdc, xml, cfg, loglevel, devicemodel, serial, skipresponse, luns, args):
+        self._rx_clean = False
         self.cdc = cdc
         self.lasterror = b""
         self.loglevel = loglevel
@@ -497,9 +500,9 @@ class firehose(metaclass=LogBase):
             res = self.cdc.read(timeout=None)
             if res == b'':
                 timeout += 1
-                if timeout == 4:
+                if timeout == 20:
                     break
-                time.sleep(0.1)
+                time.sleep(0.05)
             tmp += res
         return tmp
 
@@ -508,70 +511,116 @@ class firehose(metaclass=LogBase):
             return f" PAGES_PER_BLOCK=\"{self.cfg.PAGES_PER_BLOCK}\""
         return ""
 
-    def cmd_program(self, physical_partition_number, start_sector, filename, display=True):
+    def rw_attrs(self, start_sector, filename="", physical_partition_number=0, label="", forced_filename=""):
+        # oplus programmers require non-null filename
+        if label:
+            return f" filename=\"{forced_filename}\"" + \
+                   f" label=\"{label}\""
+        if not self.cfg.SpecialRwMode:
+            # plain firehose programmers don't know filename/label on read/erase/program
+            return ""
+        if self.cfg.SpecialRwMode == "oplus_gptmain":
+            label = "PrimaryGPT"
+            filename = f"gpt_main{physical_partition_number}.bin"
+        elif self.cfg.SpecialRwMode == "oplus_gptbackup":
+            label = "BackupGPT"
+            filename = f"gpt_backup{physical_partition_number}.bin"
+        else:
+            label = f"0x{start_sector:x}"
+            if not filename:
+                filename = f"rw_0x{start_sector:x}.bin"
+            else:
+                filename = os.path.basename(filename)
+        return f" filename=\"{filename}\"" + \
+               f" label=\"{label}\""
+
+    def cmd_program(self, physical_partition_number, start_sector, filename, display=True, label=""):
         total = os.stat(filename).st_size
         sparse = QCSparse(filename, self.loglevel)
         sparseformat = False
         if sparse.readheader():
             sparseformat = True
             total = sparse.getsize()
-        bytestowrite = total
         progbar = progress(self.cfg.SECTOR_SIZE_IN_BYTES)
-        with open(filename, "rb") as rf:
-            # Make sure we fill data up to the sector size
-            num_partition_sectors = total // self.cfg.SECTOR_SIZE_IN_BYTES
-            if (total % self.cfg.SECTOR_SIZE_IN_BYTES) != 0:
-                num_partition_sectors += 1
-            if display:
-                self.info(f"\nWriting to physical partition {str(physical_partition_number)}, " +
-                          f"sector {str(start_sector)}, sectors {str(num_partition_sectors)}")
+        num_partition_sectors = total // self.cfg.SECTOR_SIZE_IN_BYTES
+        if (total % self.cfg.SECTOR_SIZE_IN_BYTES) != 0:
+            num_partition_sectors += 1
+        if display:
+            self.info(f"\nWriting to physical partition {str(physical_partition_number)}, " +
+                      f"sector {str(start_sector)}, sectors {str(num_partition_sectors)}")
 
-            data = f"<?xml version=\"1.0\" ?><data>\n" + \
-                   f"<program SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
-                   f" num_partition_sectors=\"{num_partition_sectors}\"" + \
-                   f" physical_partition_number=\"{physical_partition_number}\"" + \
-                   f" start_sector=\"{start_sector}\""
-            data += self.nand_pages_attr() + " "
-            if self.modules is not None:
-                data += self.modules.addprogram()
-            data += f"/>\n</data>"
-            rsp = self.xmlsend(data, self.skipresponse)
+        rf = open(filename, "rb")
+        bytestowrite = total
+        if sparseformat:
+            sparse = QCSparse(filename, self.loglevel)
+            sparse.readheader()
+        try:
+            attempts = self._rw_label_attempts(label)
+            rsp = None
+            for attempt, (lbl, fn) in enumerate(attempts):
+                if not self._rx_clean:
+                    self._drain_rx()
+                data = f"<?xml version=\"1.0\" ?><data>\n" + \
+                       f"<program SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
+                       f" num_partition_sectors=\"{num_partition_sectors}\"" + \
+                       f" physical_partition_number=\"{physical_partition_number}\"" + \
+                       f" start_sector=\"{start_sector}\"" + \
+                       self.rw_attrs(start_sector, filename, physical_partition_number, lbl,
+                                     forced_filename=fn)
+                data += self.nand_pages_attr() + " "
+                if self.modules is not None:
+                    data += self.modules.addprogram()
+                data += f"/>\n</data>"
+                rsp = self.xmlsend(data, self.skipresponse)
+                if rsp.resp:
+                    break
+                if attempt + 1 < len(attempts) and self._is_forbidden(rsp):
+                    self.debug("Program forbidden under this label, retrying with fallback label.")
+                    continue
+                break
+
+            if not rsp.resp:
+                self.error(f"Error:{rsp.error}")
+                return False
+
             progbar.show_progress(prefix="Write", pos=0, total=total, display=display)
-            if rsp.resp:
-                while bytestowrite > 0:
-                    wlen = min(bytestowrite, self.cfg.MaxPayloadSizeToTargetInBytes)
+            while bytestowrite > 0:
+                wlen = min(bytestowrite, self.cfg.MaxPayloadSizeToTargetInBytes)
 
-                    if sparseformat:
-                        wdata = sparse.read(wlen)
-                    else:
-                        wdata = rf.read(wlen)
-                    bytestowrite -= wlen
-
-                    if wlen % self.cfg.SECTOR_SIZE_IN_BYTES != 0:
-                        filllen = (wlen // self.cfg.SECTOR_SIZE_IN_BYTES * self.cfg.SECTOR_SIZE_IN_BYTES) + \
-                                  self.cfg.SECTOR_SIZE_IN_BYTES
-                        wdata += b"\x00" * (filllen - wlen)
-
-                    self.cdc.write(wdata)
-                    progbar.show_progress(prefix="Write", pos=total - bytestowrite, total=total, display=display)
-                    self.cdc.write(b'')
-                # time.sleep(0.2)
-
-                wd = self.wait_for_data()
-                log = self.xml.getlog(wd)
-                rsp = self.xml.getresponse(wd)
-                if "value" in rsp:
-                    if rsp["value"] != "ACK":
-                        self.error(f"Error:")
-                        for line in log:
-                            self.error(line)
-                        return False
+                if sparseformat:
+                    wdata = sparse.read(wlen)
                 else:
-                    self.error(f"Error:{rsp}")
-                    return False
-        return True
+                    wdata = rf.read(wlen)
+                bytestowrite -= wlen
 
-    def cmd_program_buffer(self, physical_partition_number, start_sector, wfdata, display=True):
+                if wlen % self.cfg.SECTOR_SIZE_IN_BYTES != 0:
+                    filllen = (wlen // self.cfg.SECTOR_SIZE_IN_BYTES * self.cfg.SECTOR_SIZE_IN_BYTES) + \
+                              self.cfg.SECTOR_SIZE_IN_BYTES
+                    wdata += b"\x00" * (filllen - wlen)
+
+                self.cdc.write(wdata)
+                progbar.show_progress(prefix="Write", pos=total - bytestowrite, total=total, display=display)
+                self.cdc.write(b'')
+            # time.sleep(0.2)
+
+            wd = self.wait_for_data()
+            log = self.xml.getlog(wd)
+            rsp = self.xml.getresponse(wd)
+            self._rx_clean = False
+            if "value" in rsp:
+                if rsp["value"] != "ACK":
+                    self.error(f"Error:")
+                    for line in log:
+                        self.error(line)
+                    return False
+            else:
+                self.error(f"Error:{rsp}")
+                return False
+            return True
+        finally:
+            rf.close()
+
+    def cmd_program_buffer(self, physical_partition_number, start_sector, wfdata, display=True, label=""):
         bytestowrite = len(wfdata)
         total = bytestowrite
         # Make sure we fill data up to the sector size
@@ -586,7 +635,8 @@ class firehose(metaclass=LogBase):
                f"<program SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
                f" num_partition_sectors=\"{num_partition_sectors}\"" + \
                f" physical_partition_number=\"{physical_partition_number}\"" + \
-               f" start_sector=\"{start_sector}\""
+               f" start_sector=\"{start_sector}\"" + \
+               self.rw_attrs(start_sector, physical_partition_number=physical_partition_number, label=label)
         data += self.nand_pages_attr() + " "
         if self.modules is not None:
             data += self.modules.addprogram()
@@ -630,24 +680,31 @@ class firehose(metaclass=LogBase):
             self.error(f"Error:{rsp.error}")
         return True
 
-    def cmd_erase(self, physical_partition_number, start_sector, num_partition_sectors, display=True):
+    def cmd_erase(self, physical_partition_number, start_sector, num_partition_sectors, display=True, label=""):
         if display:
             self.info(f"\nErasing from physical partition {str(physical_partition_number)}, " +
                       f"sector {str(start_sector)}, sectors {str(num_partition_sectors)}")
 
         if "erase" in self.supported_functions:
-            data = f"<?xml version=\"1.0\" ?><data>\n" + \
-                   f"<erase SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
-                   f" num_partition_sectors=\"{num_partition_sectors}\"" + \
-                   f" physical_partition_number=\"{physical_partition_number}\"" + \
-                   f" start_sector=\"{start_sector}\""
-            data += self.nand_pages_attr() + " "
-            if self.modules is not None:
-                data += self.modules.addprogram()
-            data += f"/>\n</data>"
-            rsp = self.xmlsend(data, self.skipresponse)
-            if rsp.resp:
-                return True
+            attempts = self._rw_label_attempts(label)
+            for attempt, (lbl, fn) in enumerate(attempts):
+                data = f"<?xml version=\"1.0\" ?><data>\n" + \
+                       f"<erase SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
+                       f" num_partition_sectors=\"{num_partition_sectors}\"" + \
+                       f" physical_partition_number=\"{physical_partition_number}\"" + \
+                       f" start_sector=\"{start_sector}\"" + \
+                       self.rw_attrs(start_sector, physical_partition_number=physical_partition_number, label=lbl,
+                                     forced_filename=fn)
+                data += self.nand_pages_attr() + " "
+                if self.modules is not None:
+                    data += self.modules.addprogram()
+                data += f"/>\n</data>"
+                rsp = self.xmlsend(data, self.skipresponse)
+                if rsp.resp:
+                    return True
+                if attempt + 1 < len(attempts) and self._is_forbidden(rsp):
+                    self.debug("Erase forbidden under this label, retrying with fallback label.")
+                    continue
             self.error(f"Error:{rsp.error}")
             return False
 
@@ -655,7 +712,8 @@ class firehose(metaclass=LogBase):
                f"<program SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
                f" num_partition_sectors=\"{num_partition_sectors}\"" + \
                f" physical_partition_number=\"{physical_partition_number}\"" + \
-               f" start_sector=\"{start_sector}\""
+               f" start_sector=\"{start_sector}\"" + \
+               self.rw_attrs(start_sector, physical_partition_number=physical_partition_number, label=label)
         data += self.nand_pages_attr() + " "
         if self.modules is not None:
             data += self.modules.addprogram()
@@ -694,7 +752,43 @@ class firehose(metaclass=LogBase):
             return False
         return True
 
-    def cmd_read(self, physical_partition_number, start_sector, num_partition_sectors, filename, display=True):
+    def _drain_rx(self):
+        # read() must use timeout=None here, usbread loops forever otherwise
+        for _ in range(4):
+            try:
+                tmp = self.cdc.read(timeout=None)
+            except Exception:
+                break
+            if not tmp:
+                break
+        self._rx_clean = True
+
+    def _rw_label_attempts(self, label):
+        # fallback levels: canonical filename >
+        # empty filename > special_rw_mode gpt rename
+        if not self.cfg.SpecialRwMode:
+            return [("", "")]
+        attempts = []
+        if label:
+            canon = self.cfg.CanonFilenames or {}
+            for fn in dict.fromkeys((canon.get(label, ""), "")):
+                attempts.append((label, fn))
+        attempts.append(("", ""))
+        return attempts
+
+    @staticmethod
+    def _is_forbidden(rsp):
+        try:
+            err = rsp.error
+            if isinstance(err, (list, tuple)):
+                err = " ".join(str(x) for x in err)
+            err = str(err).lower()
+            return any(m in err for m in ("forbidden", "unmatch", "cannot get filename",
+                                          "cannot be null", "cannot match"))
+        except Exception:
+            return False
+
+    def cmd_read(self, physical_partition_number, start_sector, num_partition_sectors, filename, display=True, label=""):
         self.lasterror = b""
         progbar = progress(self.cfg.SECTOR_SIZE_IN_BYTES)
         if display:
@@ -702,13 +796,24 @@ class firehose(metaclass=LogBase):
                 f"\nReading from physical partition {str(physical_partition_number)}, " +
                 f"sector {str(start_sector)}, sectors {str(num_partition_sectors)}")
 
-        data = f"<?xml version=\"1.0\" ?><data><read SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
-               f" num_partition_sectors=\"{num_partition_sectors}\"" + \
-               f" physical_partition_number=\"{physical_partition_number}\"" + \
-               f" start_sector=\"{start_sector}\""
-        data += self.nand_pages_attr() + "/>\n</data>"
+        rsp = None
+        attempts = self._rw_label_attempts(label)
+        for attempt, (lbl, fn) in enumerate(attempts):
+            data = f"<?xml version=\"1.0\" ?><data><read SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
+                   f" num_partition_sectors=\"{num_partition_sectors}\"" + \
+                   f" physical_partition_number=\"{physical_partition_number}\"" + \
+                   f" start_sector=\"{start_sector}\"" + \
+                    self.rw_attrs(start_sector, filename, physical_partition_number, lbl,
+                                  forced_filename=fn)
+            data += self.nand_pages_attr() + "/>\n</data>"
 
-        rsp = self.xmlsend(data, self.skipresponse)
+            rsp = self.xmlsend(data, self.skipresponse)
+            if rsp.resp:
+                break
+            if attempt + 1 < len(attempts) and self._is_forbidden(rsp):
+                self.debug("Read forbidden under this label, retrying with fallback label.")
+                continue
+            break
         self.cdc.xmlread = False
         time.sleep(0.01)
         if not rsp.resp:
@@ -754,7 +859,7 @@ class firehose(metaclass=LogBase):
                     return False
         return True
 
-    def cmd_read_buffer(self, physical_partition_number, start_sector, num_partition_sectors, display=True):
+    def cmd_read_buffer(self, physical_partition_number, start_sector, num_partition_sectors, display=True, label=""):
         self.lasterror = b""
         prog = 0
         if display:
@@ -766,7 +871,8 @@ class firehose(metaclass=LogBase):
         data = f"<?xml version=\"1.0\" ?><data><read SECTOR_SIZE_IN_BYTES=\"{self.cfg.SECTOR_SIZE_IN_BYTES}\"" + \
                f" num_partition_sectors=\"{num_partition_sectors}\"" + \
                f" physical_partition_number=\"{physical_partition_number}\"" + \
-               f" start_sector=\"{start_sector}\""
+               f" start_sector=\"{start_sector}\"" + \
+               self.rw_attrs(start_sector, physical_partition_number=physical_partition_number, label=label)
         data += self.nand_pages_attr() + "/>\n</data>"
 
         progbar = progress(self.cfg.SECTOR_SIZE_IN_BYTES)
